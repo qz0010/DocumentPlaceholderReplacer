@@ -7,7 +7,7 @@ async function bootstrap() {
   const configService = app.get(ConfigService);
 
   app.enableCors({
-    origin: configService.get<string>('ALLOW_DOMAINS'), // Разрешить запросы только с этого домена
+    origin: process.env.ALLOW_DOMAINS || configService.get<string>('ALLOW_DOMAINS'), // Разрешить запросы только с этого домена
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Разрешенные методы
     credentials: true, // Разрешить использование cookies, если необходимо
   });
