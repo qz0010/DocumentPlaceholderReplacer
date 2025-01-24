@@ -22,7 +22,7 @@ export class DocumentController {
     if (
       !file ||
       file.mimetype !==
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     ) {
       throw new BadRequestException(
         'Invalid file format. Please upload a .docx file.',
@@ -44,7 +44,7 @@ export class DocumentController {
     if (
       !file ||
       file.mimetype !==
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     ) {
       throw new BadRequestException(
         'Invalid file format. Please upload a .docx file.',
@@ -52,14 +52,29 @@ export class DocumentController {
     }
     console.log('replacements', JSON.stringify(replacements));
 
-    // Decode replacements to handle both Cyrillic and Latin characters
+    const decodeIfBroken = (value: string): string => {
+      try {
+        const decoded = Buffer.from(value, 'latin1').toString('utf-8');
+        // If the decoded string has more valid Cyrillic characters, use it
+        const originalCyrillicCount = (value.match(/[\u0400-\u04FF]/g) || [])
+          .length;
+        const decodedCyrillicCount = (decoded.match(/[\u0400-\u04FF]/g) || [])
+          .length;
+
+        return decodedCyrillicCount > originalCyrillicCount ? decoded : value;
+      } catch {
+        return value; // Return original if decoding fails
+      }
+    };
+
+    // Decode replacements
     const decodedReplacements = Object.fromEntries(
       Object.entries(replacements).map(([key, value]) => [
-        Buffer.from(key, 'latin1').toString('utf-8'), // Decode keys
+        decodeIfBroken(key), // Decode key if broken
         Array.isArray(value)
-          ? value.map((v) => Buffer.from(v, 'latin1').toString('utf-8')) // Decode array values
-          : Buffer.from(value, 'latin1').toString('utf-8'), // Decode single values
-      ])
+          ? value.map((v) => decodeIfBroken(v)) // Decode array values
+          : decodeIfBroken(value), // Decode single value
+      ]),
     );
 
     console.log('decodedReplacements', JSON.stringify(decodedReplacements));
