@@ -8,35 +8,49 @@ import {
   Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { DocumentService } from './document.service';
 import { Response } from 'express';
 import * as PizZip from 'pizzip';
 import * as Docxtemplater from 'docxtemplater';
 import { Transform, Writable } from 'stream';
+import { convert } from 'libreoffice-convert';
 
 @Controller('document')
 export class DocumentController {
   constructor() {}
 
-  // 1. Извлечение переменных из Word-документа
   @Post('extract')
   @UseInterceptors(FileInterceptor('file'))
   async extractVariables(@UploadedFile() file: Express.Multer.File) {
-    if (
-      !file ||
-      file.mimetype !==
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ) {
+    const allowedMimes = [
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
+      'application/msword', // .doc
+      'text/plain',
+    ];
+
+    if (!file || !allowedMimes.includes(file.mimetype)) {
       throw new BadRequestException(
-        'Invalid file format. Please upload a .docx file.',
+        'Invalid file format. Please upload a .docx, .doc or .txt file.',
       );
     }
 
-    const variables = await this.extractVariablesFromBuffer(file.buffer);
+    // Если это .doc, конвертируем в .docx буфер (в памяти)
+    let buffer = file.buffer;
+    if (file.mimetype === 'application/msword') {
+      buffer = await this.convertDocToDocx(buffer);
+    }
+
+    // Если это .txt, у нас нет структуры docx — будем извлекать плейсхолдеры напрямую из текста
+    if (file.mimetype === 'text/plain') {
+      return {
+        variables: this.extractVariablesFromTxt(buffer),
+      };
+    }
+
+    // Иначе (это уже .docx или сконвертированный .doc -> .docx) — стандартная логика
+    const variables = await this.extractVariablesFromBuffer(buffer);
     return { variables };
   }
 
-  // 2. Замена переменных в Word-документе
   @Post('replace')
   @UseInterceptors(FileInterceptor('file'))
   async replaceVariables(
@@ -44,46 +58,64 @@ export class DocumentController {
     @Body() replacements: Record<string, string | string[]>,
     @Res() res: Response,
   ) {
-    if (
-      !file ||
-      file.mimetype !==
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ) {
+    const allowedMimes = [
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
+      'application/msword', // .doc
+      'text/plain',
+    ];
+
+    if (!file || !allowedMimes.includes(file.mimetype)) {
       throw new BadRequestException(
-        'Invalid file format. Please upload a .docx file.',
+        'Invalid file format. Please upload a .docx, .doc or .txt file.',
       );
     }
+
     console.log('replacements', JSON.stringify(replacements));
 
     const decodeIfBroken = (value: string): string => {
       try {
         const decoded = Buffer.from(value, 'latin1').toString('utf-8');
-        // If the decoded string has more valid Cyrillic characters, use it
         const originalCyrillicCount = (value.match(/[\u0400-\u04FF]/g) || [])
           .length;
         const decodedCyrillicCount = (decoded.match(/[\u0400-\u04FF]/g) || [])
           .length;
-
         return decodedCyrillicCount > originalCyrillicCount ? decoded : value;
       } catch {
-        return value; // Return original if decoding fails
+        return value;
       }
     };
 
-    // Decode replacements
+    // Проходимся по replacements и декодируем
     const decodedReplacements = Object.fromEntries(
       Object.entries(replacements).map(([key, value]) => [
-        decodeIfBroken(key), // Decode key if broken
+        decodeIfBroken(key),
         Array.isArray(value)
-          ? value.map((v) => decodeIfBroken(v)) // Decode array values
-          : decodeIfBroken(value), // Decode single value
+          ? value.map((v) => decodeIfBroken(v))
+          : decodeIfBroken(value),
       ]),
     );
-
     console.log('decodedReplacements', JSON.stringify(decodedReplacements));
 
+    let buffer = file.buffer;
+
+    // Если .doc -> сначала конвертируем в .docx
+    if (file.mimetype === 'application/msword') {
+      buffer = await this.convertDocToDocx(buffer);
+    }
+
+    // Если .txt -> обрабатываем напрямую как текст и возвращаем .txt
+    if (file.mimetype === 'text/plain') {
+      const updatedTxt = this.replaceVariablesInTxt(buffer, decodedReplacements);
+      res.set({
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Disposition': 'attachment; filename=updated-document.txt',
+      });
+      return res.send(updatedTxt);
+    }
+
+    // Иначе (у нас уже .docx или «сконвертированный .doc -> .docx»)
     const updatedBuffer = await this.replaceVariablesFromBuffer(
-      file.buffer,
+      buffer,
       decodedReplacements,
     );
 
@@ -95,10 +127,132 @@ export class DocumentController {
     res.send(updatedBuffer);
   }
 
-  // Чтение файла Word и поиск переменных
+  private async convertDocToDocx(inputBuffer: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      convert(inputBuffer, '.docx', undefined, (err, result) => {
+        if (err) {
+          return reject(err);
+        }
+        resolve(result);
+      });
+    });
+  }
+
+  private extractVariablesFromTxt(buffer: Buffer): string[] {
+    const text = buffer.toString('utf-8');
+    // Ищем все вхождения <~!...!~>
+    const matches = text.match(/<~!.*?!~>/g) || [];
+    // Убираем служебные символы <~! и !~>
+    return matches.map((m) => m.replace(/<~!|!~>/g, ''));
+  }
+
+  /**
+   * Псевдо-потоковая (chunk-based) замена плейсхолдеров в txt,
+   * не меняя сигнатуру метода (по-прежнему принимает Buffer и возвращает Buffer).
+   */
+  private replaceVariablesInTxt(
+    buffer: Buffer,
+    replacements: Record<string, string | string[]>,
+  ): Buffer {
+    // Размер «чанка» — условно 64 KB. Можно настроить под себя.
+    const CHUNK_SIZE = 64 * 1024;
+
+    // Счётчики для случаев, когда в replacements[tag] лежит массив
+    const usageCounters: Record<string, number> = {};
+
+    // «Хвост» для незаконченных плейсхолдеров (которые могут разрываться на границе чанков)
+    let leftover = '';
+
+    // Итоговая строка, куда будем складывать результат
+    let result = '';
+
+    // Главный цикл: двигаемся по buffer с шагом CHUNK_SIZE
+    for (let offset = 0; offset < buffer.length; offset += CHUNK_SIZE) {
+      // Вырезаем текущий чанк
+      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+
+      // Превращаем в строку + добавляем leftover
+      let text = leftover + chunk.toString('utf-8');
+
+      // Будем собирать «обработанную» часть (без незаконченного хвоста)
+      let replacedPart = '';
+      let startIndex = 0;
+      let match: RegExpExecArray | null;
+
+      // Регэксп для поиска <~!someTag!~>
+      // Захватываем в группу ([\p{L}\p{N}_]+), если хотим ограничиться буквами, цифрами, подчёркиваниями
+      const placeholderRegex = /<~!([\p{L}\p{N}_]+)!~>/gu;
+
+      // Ищем все вхождения плейсхолдеров, которые полностью поместились в text
+      while ((match = placeholderRegex.exec(text)) !== null) {
+        const index = match.index;  // где начинается <~!tag!~>
+        const fullMatch = match[0]; // сам текст <~!tag!~>
+        const tagName = match[1];   // "tag" без <~! и !~>
+
+        // Добавляем промежуточный текст, который идёт до плейсхолдера
+        replacedPart += text.slice(startIndex, index);
+
+        // Подставляем значение
+        replacedPart += this.getReplacementValue(tagName, replacements, usageCounters);
+
+        // Двигаем «указатель» дальше
+        startIndex = index + fullMatch.length;
+      }
+
+      // leftover = то, что осталось после последнего полного плейсхолдера
+      leftover = text.slice(startIndex);
+
+      // Добавляем обработанную часть к итоговой строке
+      result += replacedPart;
+    }
+
+    // Когда прошли все чанки, leftover может содержать незаконченный плейсхолдер (или просто хвост).
+    // Но раз он незаконченный, мы не можем заменить его корректно —
+    // оставим, как есть:
+    result += leftover;
+
+    // Возвращаем итоговый текст в виде Buffer
+    return Buffer.from(result, 'utf-8');
+  }
+
+  /**
+   * Вспомогательный метод, который возвращает нужную подстановку
+   * (учитывает массивное значение replacements[tag]).
+   */
+  private getReplacementValue(
+    tagName: string,
+    replacements: Record<string, string | string[]>,
+    usageCounters: Record<string, number>,
+  ): string {
+    // Если нет в словаре — вернём исходный плейсхолдер
+    if (!(tagName in replacements)) {
+      return `<~!${tagName}!~>`;
+    }
+
+    const value = replacements[tagName];
+    // Если массив
+    if (Array.isArray(value)) {
+      if (usageCounters[tagName] === undefined) {
+        usageCounters[tagName] = 0;
+      }
+      const currentIndex = usageCounters[tagName]++;
+      // Если массив «закончился», подставляем исходный плейсхолдер
+      return value[currentIndex] !== undefined
+        ? value[currentIndex]
+        : `<~!${tagName}!~>`;
+    }
+
+    // Если строка
+    return value;
+  }
+
+
+
+  //==========================================================
+  //   ОБРАБОТКА .DOCX — извлечение и замена через docxtemplater
+  //==========================================================
   async extractVariablesFromBuffer(buffer: Buffer): Promise<string[]> {
     const zip = new PizZip(buffer);
-
     const doc = new Docxtemplater(zip, {
       delimiters: { start: '<~!', end: '!~>' },
     });
@@ -107,7 +261,6 @@ export class DocumentController {
     return variables.map((v) => v.replace(/<~!|!~>/g, ''));
   }
 
-  // Замена переменных в документе
   async replaceVariablesFromBuffer(
     buffer: Buffer,
     replacements: Record<string, string | string[]>,
@@ -119,15 +272,13 @@ export class DocumentController {
     const transformStream = new Transform({
       transform(chunk, encoding, callback) {
         let modifiedBuffer: Buffer;
-
         try {
           const zip = new PizZip(chunk);
-
           const doc = new Docxtemplater(zip, {
             delimiters: { start: '<~!', end: '!~>' },
             parser: (tag) => {
-              // Используем регулярное выражение с поддержкой Unicode для поиска переменных
-              const unicodeRegex = /^[\p{L}\p{N}_]+$/u; // Учитывает буквы, цифры и подчёркивание
+              // Только буквы, цифры и нижнее подчёркивание
+              const unicodeRegex = /^[\p{L}\p{N}_]+$/u;
               if (!unicodeRegex.test(tag)) {
                 throw new Error(
                   `Invalid tag format: ${tag}. Only letters, numbers, and underscores are allowed.`,
@@ -155,7 +306,6 @@ export class DocumentController {
 
           doc.render();
 
-          // Получаем модифицированный документ как Buffer
           modifiedBuffer = Buffer.from(
             doc.getZip().generate({ type: 'nodebuffer' }),
           );
@@ -163,36 +313,30 @@ export class DocumentController {
           return callback(err);
         }
 
-        // Передаём модифицированный кусок дальше в поток
         callback(null, modifiedBuffer);
       },
     });
 
     // Создаём поток вывода для сохранения результата
     const output: Writable = new Writable();
-
-    // Сохраняем финальный результат в переменной
     const resultChunks: Buffer[] = [];
+
     output._write = (chunk, encoding, callback) => {
       resultChunks.push(chunk);
       callback();
     };
 
     return new Promise<Buffer>((resolve, reject) => {
-      // Слушаем завершение записи
       output.on('finish', () => {
         resolve(Buffer.concat(resultChunks));
       });
 
-      // Обрабатываем ошибки
       transformStream.on('error', (err) => {
         reject(err);
       });
 
-      // Подключаем буфер к потокам
       transformStream.pipe(output);
 
-      // Запускаем поток с исходным буфером
       transformStream.write(buffer);
       transformStream.end();
     });
