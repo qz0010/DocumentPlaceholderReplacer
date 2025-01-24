@@ -22,7 +22,7 @@ export class DocumentController {
     if (
       !file ||
       file.mimetype !==
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     ) {
       throw new BadRequestException(
         'Invalid file format. Please upload a .docx file.',
@@ -44,16 +44,29 @@ export class DocumentController {
     if (
       !file ||
       file.mimetype !==
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     ) {
       throw new BadRequestException(
         'Invalid file format. Please upload a .docx file.',
       );
     }
+    console.log('replacements', JSON.stringify(replacements));
+
+    // Decode replacements to handle both Cyrillic and Latin characters
+    const decodedReplacements = Object.fromEntries(
+      Object.entries(replacements).map(([key, value]) => [
+        Buffer.from(key, 'latin1').toString('utf-8'), // Decode keys
+        Array.isArray(value)
+          ? value.map((v) => Buffer.from(v, 'latin1').toString('utf-8')) // Decode array values
+          : Buffer.from(value, 'latin1').toString('utf-8'), // Decode single values
+      ])
+    );
+
+    console.log('decodedReplacements', JSON.stringify(decodedReplacements));
 
     const updatedBuffer = await this.documentService.replaceVariables(
       file.buffer,
-      replacements,
+      decodedReplacements,
     );
 
     res.set({
